@@ -1,25 +1,37 @@
 from flask import Flask
 import threading
-import os, requests, re, time, threading
+import os, requests, re, time
 from datetime import datetime, timezone
 import telebot
 
-# === SAFE - reads from Koyeb Environment ===
+# === ENV ===
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1004370772560"))
 CHAT_ID = int(os.environ.get("CHAT_ID", "0"))
 TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY")
 CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "none")
 CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "none")
-# ===========================================
 
 if not TELEGRAM_TOKEN:
-    print("ERROR: TELEGRAM_TOKEN not set in Koyeb env!")
+    print("ERROR: TELEGRAM_TOKEN not set!")
     exit(1)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 active_trades = {}
 last_brief_time = None
+
+# --- FLASK FOR RENDER - MUST BE AT TOP ---
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "V5.1 Bot is Alive!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+threading.Thread(target=run_web, daemon=True).start()
+# ------------------------------------------
 
 def send_alert(msg):
     print(msg)
@@ -135,16 +147,9 @@ def price_watcher():
         time.sleep(30)
 
 threading.Thread(target=price_watcher, daemon=True).start()
-print("V5.1 listening...")
+
+print("V5.1 listening... Removing old webhook...")
 bot.remove_webhook()
-bot.infinity_polling()
-# Keep Render happy - fake web server
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run_web():
-    app.run(host='0.0.0.0', port=10000)
-
-threading.Thread(target=run_web).start()
+time.sleep(3)
+print("Starting polling...")
+bot.infinity_polling(skip_pending=True)
