@@ -1,3 +1,5 @@
+from flask import Flask
+import threading
 import os, requests, re, time, threading
 from datetime import datetime, timezone
 import telebot
@@ -135,3 +137,13 @@ def price_watcher():
 threading.Thread(target=price_watcher, daemon=True).start()
 print("V5.1 listening...")
 bot.infinity_polling()
+# Keep Render happy - fake web server
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=10000)
+
+threading.Thread(target=run_web).start()
