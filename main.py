@@ -136,6 +136,7 @@ def price_watcher():
 
 threading.Thread(target=price_watcher, daemon=True).start()
 print("V5.1 listening...")
+bot.remove_webhook()
 bot.infinity_polling()
 # Keep Render happy - fake web server
 app = Flask(__name__)
