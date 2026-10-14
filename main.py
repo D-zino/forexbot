@@ -4,314 +4,270 @@ from zoneinfo import ZoneInfo
 import telebot
 from flask import Flask
 
-# ========== CONFIG ==========
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-TD_KEY = os.getenv("TWELVEDATA_API_KEY")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-CHAT_ID = os.getenv("CHAT_ID")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
-try: CHANNEL_ID = int(CHANNEL_ID)
+TOKEN=os.getenv("TELEGRAM_TOKEN")
+TD_KEY=os.getenv("TWELVEDATA_API_KEY")
+CHANNEL_ID=os.getenv("CHANNEL_ID")
+try: CHANNEL_ID=int(CHANNEL_ID)
 except: pass
-PORT = int(os.getenv("PORT", 10000))
+PORT=int(os.getenv("PORT",10000))
+RENDER_URL=os.getenv("RENDER_EXTERNAL_URL")
 
-# ========== FLASK KEEPALIVE SERVER ==========
-app = Flask(__name__)
+app=Flask(__name__)
 @app.route('/')
-def home():
-    return "V11.6 FULL WORKFLOW - LIVE INTERPRETATION + MONITOR + KEEPALIVE - OK"
+def home(): return "V11.8 COMPREHENSIVE FORMAT + LIVE"
+threading.Thread(target=lambda: app.run(host='0.0.0.0',port=PORT),daemon=True).start()
 
-@app.route('/health')
-def health():
-    return "OK"
-
-threading.Thread(target=lambda: app.run(host='0.0.0.0', port=PORT), daemon=True).start()
-
-# ========== SELF PING ==========
 def keep_alive():
     while True:
         time.sleep(600)
         try:
-            if RENDER_URL:
-                requests.get(RENDER_URL, timeout=10)
-                print(f"Self ping OK {RENDER_URL}")
-        except Exception as e:
-            print(f"Self ping fail {e}")
+            if RENDER_URL: requests.get(RENDER_URL,timeout=10)
+        except: pass
+threading.Thread(target=keep_alive,daemon=True).start()
 
-threading.Thread(target=keep_alive, daemon=True).start()
+bot=telebot.TeleBot(TOKEN,parse_mode="HTML",threaded=False)
+for _ in range(3):
+    try: bot.remove_webhook(); bot.delete_webhook(drop_pending_updates=True); time.sleep(2); break
+    except: time.sleep(2)
 
-# ========== TELEGRAM BOT - SINGLE INSTANCE FIX ==========
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=False)
-
-# CRITICAL: Delete webhook to fix Conflict 409
-for attempt in range(5):
-    try:
-        print(f"Clearing webhook attempt {attempt+1}")
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.delete_webhook(drop_pending_updates=True)
-        time.sleep(2)
-        print("Webhook cleared")
-        break
-    except Exception as e:
-        print(f"Webhook clear error {e}")
-        time.sleep(3)
-
-WAT = ZoneInfo("Africa/Lagos")
-FALLBACK = {"EUR/USD":1.1205,"GBP/USD":1.3270,"USD/CAD":1.3865,"EUR/JPY":177.34,"USD/JPY":158.31,"NAS100":27203,"US30":51677,"XAU/USD":4155.52,"DXY":98.8,"WTI":94.70}
-
-# ========== DATABASE ==========
-conn = sqlite3.connect("trades.db", check_same_thread=False)
+WAT=ZoneInfo("Africa/Lagos")
+conn=sqlite3.connect("trades.db",check_same_thread=False)
 conn.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, pair TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL, bias TEXT, time TEXT, result TEXT, pips REAL, stage TEXT)")
 conn.execute("CREATE TABLE IF NOT EXISTS probables (pair TEXT PRIMARY KEY, time TEXT, fvg_low REAL, fvg_high REAL, bias TEXT)")
 conn.commit()
 
-# ========== PRICE FUNCTIONS ==========
-def get_price(sym):
+def get_price_td(sym):
     try:
-        r = requests.get(f"https://api.twelvedata.com/price?symbol={sym}&apikey={TD_KEY}", timeout=10).json()
-        if 'price' in r:
-            return float(r['price'])
+        r=requests.get(f"https://api.twelvedata.com/price?symbol={sym}&apikey={TD_KEY}",timeout=10).json()
+        print(f"TD {sym} -> {r}")
+        if 'price' in r: return float(r['price'])
+        return None
     except Exception as e:
-        print(f"price err {sym} {e}")
-    return None
+        print(f"ERR {sym} {e}")
+        return None
 
-def get_candles(sym, interval="15min", count=15):
-    try:
-        r = requests.get(f"https://api.twelvedata.com/time_series?symbol={sym}&interval={interval}&outputsize={count}&apikey={TD_KEY}", timeout=15).json()
-        return r.get('values', [])
-    except:
-        return []
-
-def get_all():
-    mapping = {"EUR/USD":"EUR/USD","GBP/USD":"GBP/USD","USD/CAD":"USD/CAD","EUR/JPY":"EUR/JPY","USD/JPY":"USD/JPY","XAU/USD":"XAU/USD","NAS100":"NDX","US30":"DJI","DXY":"DXY","WTI":"WTI/USD"}
-    data = {}
-    for k, td in mapping.items():
-        p = get_price(td)
-        data[k] = p if p else FALLBACK[k]
-        time.sleep(1.2)
-    data['CPI'] = "1:30 PM WAT"
+def get_all_live():
+    mapping={"EUR/USD":"EUR/USD","GBP/USD":"GBP/USD","USD/CAD":"USD/CAD","EUR/JPY":"EUR/JPY","USD/JPY":"USD/JPY","XAU/USD":"XAU/USD","NAS100":"NDX","US30":"DJI","DXY":"DXY","WTI":"WTI/USD"}
+    data={}
+    for disp, td in mapping.items():
+        p=get_price_td(td)
+        data[disp]=p
+        time.sleep(2.5)
+    data['CPI']="1:30 PM WAT"
     return data
 
 def is_choch_bullish(c):
-    try:
-        cl = [float(x['close']) for x in c[:5]]
-        return cl[0] > max(cl[1:3])
-    except:
-        return False
-
+    try: cl=[float(x['close']) for x in c[:5]]; return cl[0] > max(cl[1:3])
+    except: return False
 def is_choch_bearish(c):
+    try: cl=[float(x['close']) for x in c[:5]]; return cl[0] < min(cl[1:3])
+    except: return False
+def get_candles(sym, interval="15min", count=15):
     try:
-        cl = [float(x['close']) for x in c[:5]]
-        return cl[0] < min(cl[1:3])
-    except:
-        return False
-
-def find_bull_fvg(candles):
+        r=requests.get(f"https://api.twelvedata.com/time_series?symbol={sym}&interval={interval}&outputsize={count}&apikey={TD_KEY}",timeout=12).json()
+        return r.get('values',[])
+    except: return []
+def find_bull_fvg(c):
     try:
-        for i in range(len(candles)-2):
-            if float(candles[i+2]['high']) < float(candles[i]['low']):
-                return {'low':float(candles[i+2]['high']), 'high':float(candles[i]['low'])}
+        for i in range(len(c)-2):
+            if float(c[i+2]['high']) < float(c[i]['low']):
+                return {'low':float(c[i+2]['high']), 'high':float(c[i]['low'])}
     except: pass
     return None
-
-def find_bear_fvg(candles):
+def find_bear_fvg(c):
     try:
-        for i in range(len(candles)-2):
-            if float(candles[i+2]['low']) > float(candles[i]['high']):
-                return {'low':float(candles[i]['high']), 'high':float(candles[i+2]['low'])}
+        for i in range(len(c)-2):
+            if float(c[i+2]['low']) > float(c[i]['high']):
+                return {'low':float(c[i]['high']), 'high':float(c[i+2]['low'])}
     except: pass
     return None
-
 def calc_pips(pair, entry, current, bias):
-    mult = 100 if "JPY" in pair else 10000 if "/" in pair else 1
+    mult=100 if "JPY" in pair else 10000 if "/" in pair else 1
     return (current-entry)*mult if bias=="BUY" else (entry-current)*mult
 
-# ========== FULL MORNING INTERPRETATION ==========
+# ========== COMPREHENSIVE FORMATTING LIKE THIS MORNING ==========
 def generate_full():
-    d = get_all()
-    now = datetime.now(WAT)
-    h = f"Gold {d['XAU/USD']:.0f} holding ahead CPI {d['CPI']}, DXY {d['DXY']:.1f} firm, EUR/USD {d['EUR/USD']:.4f}, WTI ${d['WTI']:.2f} — CPI in focus"
+    d=get_all_live()
+    now=datetime.now(WAT)
 
-    body = ""
-    for pair in ["EUR/USD","GBP/USD","USD/CAD","XAU/USD","EUR/JPY","USD/JPY","NAS100","US30"]:
-        live = d[pair]
-        td_sym = {"EUR/USD":"EUR/USD","GBP/USD":"GBP/USD","USD/CAD":"USD/CAD","XAU/USD":"XAU/USD","EUR/JPY":"EUR/JPY","USD/JPY":"USD/JPY","NAS100":"NDX","US30":"DJI"}[pair]
-        c15 = get_candles(td_sym, "15min", 10)
-        bull = is_choch_bullish(c15)
-        bear = is_choch_bearish(c15)
+    # Live values with check
+    def live(pair, fmt="{:.4f}"):
+        v=d.get(pair)
+        return fmt.format(v) if v else "FETCHING"
 
-        if pair == "EUR/USD":
-            body += f"<b>EUR/USD:</b> Current {live:.4f} — DXY {d['DXY']:.1f}. Sweep of 1.1190 expected pre-CPI, then 15m CHOCH bullish needed, then 5m FVG {live-0.0005:.4f}-{live+0.0005:.4f} retest for BUY to 1.1225/1.1240 SL 1.1185. Justification: DXY resistance + London sweep.\n\n"
-        elif pair == "GBP/USD":
-            body += f"<b>GBP/USD:</b> Current {live:.4f} — Holding {live:.4f}. Need 1.3250 sweep + 15m CHOCH bullish = BUY bias, else no trade. TP 1.3300/1.3325 SL 1.3230. Wait FVG retest.\n\n"
-        elif pair == "USD/CAD":
-            body += f"<b>USD/CAD:</b> Current {live:.4f} — Oil {d['WTI']:.2f} support. Grab of 1.3885 + 15m CHOCH bearish = SELL to 1.3830/1.3800 SL 1.3905. Need 5m FVG retest.\n\n"
-        elif pair == "XAU/USD":
-            body += f"<b>XAU/USD:</b> Current {live:.2f} — Gold {live:.2f} ahead CPI {d['CPI']}. Sweep 4165 + CHOCH bearish = SELL to 4145/4135 SL 4175, waiting FVG retest.\n\n"
-        elif pair == "EUR/JPY":
-            body += f"<b>EUR/JPY:</b> Current {live:.2f} — Range. No clear CHOCH yet ({'bull' if bull else 'bear' if bear else 'none'}), wait.\n\n"
-        elif pair == "USD/JPY":
-            body += f"<b>USD/JPY:</b> Current {live:.2f} — DXY {d['DXY']:.1f}. Wait sweep.\n\n"
-        elif pair in ["NAS100","US30"]:
-            body += f"<b>{pair}:</b> Current {live:.0f} — CPI risk, wait 15m CHOCH after open.\n\n"
+    eurusd=d.get("EUR/USD"); gbpusd=d.get("GBP/USD"); usdcad=d.get("USD/CAD")
+    eurusd_s=f"{eurusd:.4f}" if eurusd else "1.1205*"
+    gbpusd_s=f"{gbpusd:.4f}" if gbpusd else "1.3270*"
+    usdcad_s=f"{usdcad:.4f}" if usdcad else "1.3865*"
+    xau=d.get("XAU/USD"); xau_s=f"{xau:.2f}" if xau else "4155*"
+    dxy=d.get("DXY"); dxy_s=f"{dxy:.2f}" if dxy else "98.8*"
+    wti=d.get("WTI"); wti_s=f"{wti:.2f}" if wti else "94.70*"
+    eurjpy=d.get("EUR/JPY"); eurjpy_s=f"{eurjpy:.2f}" if eurjpy else "177.34*"
+    usdjpy=d.get("USD/JPY"); usdjpy_s=f"{usdjpy:.2f}" if usdjpy else "158.31*"
+    nas=d.get("NAS100"); nas_s=f"{nas:.0f}" if nas else "27203*"
+    us30=d.get("US30"); us30_s=f"{us30:.0f}" if us30 else "51677*"
 
-    full = f"<b>EUR/USD..US30 — Full ICT brief {now.strftime('%a %b %d %I:%M %p WAT')}</b>\n\n<b>HEADLINES:</b> {h}\n\n{body}All entries wait for Sweep + 15m CHOCH + 5m FVG retest — Educational only\nLive from TwelveData"
+    full=f"""<b>📊 EUR/USD..US30 — Full ICT Brief {now.strftime('%a %b %d %I:%M %p WAT')}</b>
+
+<b>📰 HEADLINES:</b> Gold {xau_s} holding ahead CPI {d['CPI']}, DXY {dxy_s} firm, EUR/USD {eurusd_s}, WTI ${wti_s} — CPI in focus | Live from TwelveData
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+
+<b>💶 EUR/USD: Current {eurusd_s} — DXY {dxy_s}</b>
+<b>Bias:</b> BUY after sweep
+<b>Setup:</b> Sweep of 1.1190 expected pre-CPI London session
+<b>Confirmation:</b> 15m CHOCH bullish + 5m FVG {eurusd-0.0005:.4f}-{eurusd+0.0005:.4f} if eurusd else "1.1200-1.1210" retest
+<b>Entry:</b> BUY {eurusd_s} after retest
+<b>SL:</b> 1.1185 (20p)
+<b>TP1:</b> 1.1225 | <b>TP2:</b> 1.1240
+<b>Justification:</b> DXY {dxy_s} showing resistance at 99.0, London sweep likely to grab liquidity below 1.1190 then bullish CHOCH for long. CPI risk managed with BE+0.5.
+<b>Status:</b> ⚠️ WAIT for FVG retest
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+
+<b>💷 GBP/USD: Current {gbpusd_s}</b>
+<b>Bias:</b> BUY bias
+<b>Setup:</b> Need 1.3250 sweep + 15m CHOCH bullish
+<b>Entry:</b> BUY after 5m FVG retest
+<b>SL:</b> 1.3230 | <b>TP:</b> 1.3300 / 1.3325
+<b>Justification:</b> GBP holding strength vs DXY {dxy_s}, USD weakness post-CPI expected. Wait for London liquidity grab.
+<b>Status:</b> ⚠️ WAIT
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+
+<b>💵 USD/CAD: Current {usdcad_s} — Oil ${wti_s}</b>
+<b>Bias:</b> SELL
+<b>Setup:</b> Grab of 1.3885 high + 15m CHOCH bearish
+<b>Entry:</b> SELL after 5m FVG retest
+<b>SL:</b> 1.3905 | <b>TP:</b> 1.3830 / 1.3800
+<b>Justification:</b> WTI ${wti_s} supporting CAD strength, DXY {dxy_s} resistance, USD/CAD bearish CHOCH on 15m expected.
+<b>Status:</b> ⚠️ WAIT
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+
+<b>🥇 XAU/USD: Current {xau_s}</b>
+<b>Bias:</b> SELL
+<b>Setup:</b> Sweep 4165 high + 15m CHOCH bearish
+<b>Entry:</b> SELL after 5m FVG retest
+<b>SL:</b> 4175 | <b>TP:</b> 4145 / 4135
+<b>Justification:</b> Gold {xau_s} overbought ahead CPI {d['CPI']}, DXY {dxy_s} firm, liquidity grab above 4165 then sell.
+<b>Status:</b> ⚠️ WAIT
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+
+<b>💱 EUR/JPY: Current {eurjpy_s}</b>
+<b>Bias:</b> Range
+<b>Analysis:</b> No clear 15m CHOCH yet, EUR/USD {eurusd_s} vs USD/JPY {usdjpy_s} conflict. Wait for break.
+<b>Status:</b> ⏸️ NO TRADE
+
+<b>💱 USD/JPY: Current {usdjpy_s} — DXY {dxy_s}</b>
+<b>Bias:</b> Wait sweep
+<b>Status:</b> ⏸️ NO TRADE
+
+<b>📈 NAS100: Current {nas_s}</b>
+<b>Bias:</b> CPI risk
+<b>Analysis:</b> Wait 15m CHOCH after 2:30pm open, {nas_s} holding.
+<b>Status:</b> ⏸️ WAIT CPI
+
+<b>📈 US30: Current {us30_s}</b>
+<b>Bias:</b> CPI risk
+<b>Status:</b> ⏸️ WAIT CPI
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+<b>📌 RULES:</b> All entries wait for Sweep + 15m CHOCH + 5m FVG retest
+<b>📌 MANAGEMENT:</b> BE+0.5 at 50% to TP1, trail to TP2
+<b>⚠️ Educational only — Live prices from TwelveData</b>
+"""
     return full, d
 
-# ========== PROBABLE -> VALID WORKFLOW ==========
 def check_trades():
-    d = get_all()
-    msgs = []
+    d=get_all_live()
+    msgs=[]
     for pair in ["EUR/USD","GBP/USD","USD/CAD","XAU/USD"]:
-        live = d[pair]
-        c15 = get_candles(pair, "15min", 12)
-        c5 = get_candles(pair, "5min", 20)
-        time.sleep(1)
-        cur = conn.execute("SELECT * FROM probables WHERE pair=?", (pair,)).fetchone()
-        bullish = is_choch_bullish(c15)
-        bearish = is_choch_bearish(c15)
-        bull_fvg = find_bull_fvg(c5)
-        bear_fvg = find_bear_fvg(c5)
-
+        live=d.get(pair)
+        if not live: continue
+        c15=get_candles(pair,"15min",12); c5=get_candles(pair,"5min",20); time.sleep(1)
+        cur=conn.execute("SELECT * FROM probables WHERE pair=?",(pair,)).fetchone()
+        bullish=is_choch_bullish(c15); bearish=is_choch_bearish(c15)
+        bull_fvg=find_bull_fvg(c5); bear_fvg=find_bear_fvg(c5)
         if not cur:
             if pair in ["EUR/USD","GBP/USD"] and bullish and bull_fvg:
-                conn.execute("REPLACE INTO probables VALUES (?,?,?,?,?)", (pair, datetime.now(WAT).isoformat(), bull_fvg['low'], bull_fvg['high'], "BUY"))
-                conn.commit()
-                msgs.append(f"⚠️ PROBABLE {pair} BUY @ {live}\nLive interpretation: Sweep + 15m CHOCH bullish confirmed at {live}, waiting 5m FVG {bull_fvg['low']:.4f}-{bull_fvg['high']:.4f} retest before VALID. DXY {d['DXY']:.1f}")
+                conn.execute("REPLACE INTO probables VALUES (?,?,?,?,?)",(pair,datetime.now(WAT).isoformat(),bull_fvg['low'],bull_fvg['high'],"BUY")); conn.commit()
+                msgs.append(f"⚠️ <b>PROBABLE {pair} BUY @ LIVE {live:.4f}</b>\nSweep + 15m CHOCH bullish confirmed, waiting 5m FVG {bull_fvg['low']:.4f}-{bull_fvg['high']:.4f} retest\nDXY {d.get('DXY','?')}")
             elif pair in ["USD/CAD","XAU/USD"] and bearish and bear_fvg:
-                conn.execute("REPLACE INTO probables VALUES (?,?,?,?,?)", (pair, datetime.now(WAT).isoformat(), bear_fvg['low'], bear_fvg['high'], "SELL"))
-                conn.commit()
-                msgs.append(f"⚠️ PROBABLE {pair} SELL @ {live}\nGrab + 15m CHOCH bearish done, waiting 5m FVG {bear_fvg['low']:.4f}-{bear_fvg['high']:.4f} retest. Live {live}")
+                conn.execute("REPLACE INTO probables VALUES (?,?,?,?,?)",(pair,datetime.now(WAT).isoformat(),bear_fvg['low'],bear_fvg['high'],"SELL")); conn.commit()
+                msgs.append(f"⚠️ <b>PROBABLE {pair} SELL @ LIVE {live:.4f}</b>\nGrab + CHOCH bearish done, waiting FVG {bear_fvg['low']:.4f}-{bear_fvg['high']:.4f}")
         else:
-            fvg_low = cur[2]; fvg_high = cur[3]; bias = cur[4]
+            fvg_low=cur[2]; fvg_high=cur[3]; bias=cur[4]
             if fvg_low <= live <= fvg_high:
-                if pair == "EUR/USD": sl=1.1185; tp1=1.1225; tp2=1.1240
-                elif pair == "GBP/USD": sl=1.3230; tp1=1.3300; tp2=1.3325
-                elif pair == "USD/CAD": sl=1.3905; tp1=1.3830; tp2=1.3800
-                else: sl=live+15; tp1=live-10; tp2=live-20
-                conn.execute("INSERT INTO trades VALUES (NULL,?,?,?,?,?,?,?,?,?,?)", (pair, live, sl, tp1, tp2, bias, datetime.now(WAT).isoformat(), "OPEN", 0, "VALID_RETEST"))
-                conn.execute("DELETE FROM probables WHERE pair=?", (pair,))
-                conn.commit()
-                msgs.append(f"✅ VALID {pair} {bias} @ {live} — CONFIRMED AFTER FVG RETEST\nJustification: Sweep + CHOCH + 5m FVG {fvg_low:.4f}-{fvg_high:.4f} retest hit at {live}\nSL {sl} TP1 {tp1} TP2 {tp2}\nManagement: BE+0.5 at 50% to TP1, trail to TP2\nLogged to journal @ {live}")
+                sl,tp1,tp2=(1.1185,1.1225,1.1240) if pair=="EUR/USD" else (1.3230,1.3300,1.3325) if pair=="GBP/USD" else (1.3905,1.3830,1.3800) if pair=="USD/CAD" else (live+15, live-10, live-20)
+                conn.execute("INSERT INTO trades VALUES (NULL,?,?,?,?,?,?,?,?,?,?)",(pair,live,sl,tp1,tp2,bias,datetime.now(WAT).isoformat(),"OPEN",0,"VALID_RETEST"))
+                conn.execute("DELETE FROM probables WHERE pair=?",(pair,)); conn.commit()
+                msgs.append(f"✅ <b>VALID {pair} {bias} @ {live:.4f} — CONFIRMED AFTER FVG RETEST</b>\n<b>Justification:</b> Sweep + CHOCH + 5m FVG {fvg_low:.4f}-{fvg_high:.4f} retest hit at LIVE {live:.4f}\nSL {sl} TP1 {tp1} TP2 {tp2}\nBE+0.5 at 50% to TP1\nLogged to journal")
     return msgs
 
-# ========== LIVE MONITOR BE+0.5 TP1 TP2 SL ==========
 def monitor_trades():
     while True:
         try:
-            cur = conn.execute("SELECT id, pair, entry, sl, tp1, tp2, bias, result FROM trades WHERE result IN ('OPEN','BE','TP1_HIT')").fetchall()
-            if not cur:
-                time.sleep(120)
-                continue
-            d = get_all()
-            for tid, pair, entry, sl, tp1, tp2, bias, result in cur:
-                live = d.get(pair)
+            cur=conn.execute("SELECT id, pair, entry, sl, tp1, tp2, bias, result FROM trades WHERE result IN ('OPEN','BE','TP1_HIT')").fetchall()
+            if not cur: time.sleep(120); continue
+            d=get_all_live()
+            for tid,pair,entry,sl,tp1,tp2,bias,result in cur:
+                live=d.get(pair)
                 if not live: continue
-                pips = calc_pips(pair, entry, live, bias)
-                tp1_pips = calc_pips(pair, entry, tp1, bias)
-                if result == "OPEN" and pips >= tp1_pips*0.5:
-                    conn.execute("UPDATE trades SET result='BE', pips=? WHERE id=?", (pips, tid))
-                    conn.commit()
-                    bot.send_message(CHANNEL_ID, f"🔧 MANAGEMENT {pair} {bias} @ {entry}\nLive {live} +{pips:.1f}p → BE+0.5 moved, trailing to TP1 {tp1}")
+                pips=calc_pips(pair,entry,live,bias)
+                tp1_pips=calc_pips(pair,entry,tp1,bias)
+                if result=="OPEN" and pips>=tp1_pips*0.5:
+                    conn.execute("UPDATE trades SET result='BE', pips=? WHERE id=?",(pips,tid)); conn.commit()
+                    bot.send_message(CHANNEL_ID,f"🔧 <b>BE+0.5 {pair} {bias}</b> @ {entry}\nLive {live:.4f} +{pips:.1f}p → BE moved")
                 elif result in ("OPEN","BE") and ((bias=="BUY" and live>=tp1) or (bias=="SELL" and live<=tp1)):
-                    conn.execute("UPDATE trades SET result='TP1_HIT', pips=? WHERE id=?", (pips, tid))
-                    conn.commit()
-                    bot.send_message(CHANNEL_ID, f"✅ TP1 HIT {pair} {bias} @ {entry} → {live} +{pips:.1f}p\nTP1 {tp1} done, BE locked, to TP2 {tp2}")
-                elif result == "TP1_HIT" and ((bias=="BUY" and live>=tp2) or (bias=="SELL" and live<=tp2)):
-                    final = calc_pips(pair, entry, tp2, bias)
-                    conn.execute("UPDATE trades SET result='TP2_HIT', pips=? WHERE id=?", (final, tid))
-                    conn.commit()
-                    bot.send_message(CHANNEL_ID, f"🏆 TP2 HIT {pair} {bias} @ {entry} → {tp2} +{final:.1f}p FULL")
-                elif (bias=="BUY" and live<=sl) or (bias=="SELL" and live>=sl):
-                    if result in ("BE","TP1_HIT"):
-                        conn.execute("UPDATE trades SET result='BE_HIT', pips=? WHERE id=?", (2, tid))
-                        conn.commit()
-                        bot.send_message(CHANNEL_ID, f"⚠️ {pair} BE HIT @ {live} +2p secured")
-                    else:
-                        conn.execute("UPDATE trades SET result='SL_HIT', pips=? WHERE id=?", (pips, tid))
-                        conn.commit()
-                        bot.send_message(CHANNEL_ID, f"❌ SL HIT {pair} {bias} @ {entry} → {sl} {pips:.1f}p")
+                    conn.execute("UPDATE trades SET result='TP1_HIT', pips=? WHERE id=?",(pips,tid)); conn.commit()
+                    bot.send_message(CHANNEL_ID,f"✅ <b>TP1 HIT {pair}</b> +{pips:.1f}p Live {live:.4f}")
+                elif result=="TP1_HIT" and ((bias=="BUY" and live>=tp2) or (bias=="SELL" and live<=tp2)):
+                    final=calc_pips(pair,entry,tp2,bias)
+                    conn.execute("UPDATE trades SET result='TP2_HIT', pips=? WHERE id=?",(final,tid)); conn.commit()
+                    bot.send_message(CHANNEL_ID,f"🏆 <b>TP2 HIT {pair}</b> +{final:.1f}p FULL")
             time.sleep(120)
         except Exception as e:
-            print(f"monitor {e}")
-            time.sleep(30)
+            print(f"monitor {e}"); time.sleep(30)
 
-threading.Thread(target=monitor_trades, daemon=True).start()
+threading.Thread(target=monitor_trades,daemon=True).start()
 
-# ========== COMMANDS ==========
 @bot.message_handler(commands=['start','brief'])
 def cmd_brief(m):
-    bot.send_message(m.chat.id, "☀️ Fetching live prices + interpretation...")
+    bot.send_message(m.chat.id,"☀️ Fetching REAL live prices + comprehensive interpretation...")
     try:
-        full, d = generate_full()
-        for i in range(0, len(full), 3800):
-            bot.send_message(m.chat.id, full[i:i+3800])
-    except Exception as e:
-        bot.send_message(m.chat.id, f"Error {e}")
+        full,d=generate_full()
+        for i in range(0,len(full),3800): bot.send_message(m.chat.id,full[i:i+3800])
+    except Exception as e: bot.send_message(m.chat.id,f"Error {e}")
 
-@bot.message_handler(commands=['valid','check'])
-def cmd_valid(m):
-    bot.send_message(m.chat.id, "🔍 Live scan: sweep+CHOCH → FVG retest...")
+@bot.message_handler(commands=['valid','check','probables','pips','journal'])
+def cmd_others(m):
     try:
-        msgs = check_trades()
-        if not msgs:
-            bot.send_message(m.chat.id, "No VALID after retest yet — /probables to see waiting")
+        if 'probables' in m.text:
+            cur=conn.execute("SELECT * FROM probables").fetchall()
+            bot.send_message(m.chat.id,"No probables" if not cur else "\n".join([f"{r[0]} {r[4]} FVG {r[2]}-{r[3]}" for r in cur]))
+        elif 'valid' in m.text or 'check' in m.text:
+            msgs=check_trades()
+            bot.send_message(m.chat.id,"No VALID after retest" if not msgs else "\n".join(msgs))
         else:
-            for msg in msgs:
-                bot.send_message(m.chat.id, msg)
-    except Exception as e:
-        bot.send_message(m.chat.id, f"Error {e}")
+            cur=conn.execute("SELECT pair, entry, bias, result, pips FROM trades ORDER BY id DESC LIMIT 10").fetchall()
+            bot.send_message(m.chat.id,"Empty" if not cur else "\n".join([f"{r[0]} {r[2]} @ {r[1]} | {r[3]} {r[4]:.1f}p" for r in cur]))
+    except Exception as e: bot.send_message(m.chat.id,f"Error {e}")
 
-@bot.message_handler(commands=['probables'])
-def cmd_prob(m):
-    cur = conn.execute("SELECT * FROM probables").fetchall()
-    if not cur:
-        bot.send_message(m.chat.id, "No probables waiting")
-    else:
-        txt = "⚠️ Probables waiting FVG retest:\n"
-        for r in cur:
-            txt += f"{r[0]} {r[4]} FVG {r[2]}-{r[3]} {r[1][:16]}\n"
-        bot.send_message(m.chat.id, txt)
-
-@bot.message_handler(commands=['pips','journal'])
-def cmd_journal(m):
-    cur = conn.execute("SELECT pair, entry, bias, time, result, pips, stage FROM trades ORDER BY id DESC LIMIT 20").fetchall()
-    if not cur:
-        bot.send_message(m.chat.id, "📒 Journal empty")
-    else:
-        txt = "📒 Journal (VALID after retest + live monitor):\n"
-        for r in cur:
-            txt += f"{r[0]} {r[2]} @ {r[1]} | {r[4]} {r[5]:.1f}p | {r[6]} | {r[3][:16]}\n"
-        bot.send_message(m.chat.id, txt)
-
-# ========== SCHEDULER ==========
 def scheduler():
     while True:
-        now = datetime.now(WAT)
-        if now.weekday() < 5 and now.hour == 7 and 0 <= now.minute < 20:
+        now=datetime.now(WAT)
+        if now.weekday()<5 and now.hour==7 and 0<=now.minute<20:
             try:
-                full, d = generate_full()
-                for i in range(0, len(full), 3800):
-                    bot.send_message(CHANNEL_ID, full[i:i+3800])
-                    time.sleep(2)
-            except Exception as e:
-                print(f"scheduler brief {e}")
-            time.sleep(3600)
-        if now.weekday() < 5 and 8 <= now.hour <= 16 and now.minute % 15 == 0:
-            try:
-                for msg in check_trades():
-                    bot.send_message(CHANNEL_ID, msg)
+                full,d=generate_full()
+                for i in range(0,len(full),3800): bot.send_message(CHANNEL_ID,full[i:i+3800]); time.sleep(2)
             except: pass
-            time.sleep(60)
+            time.sleep(3600)
         time.sleep(30)
 
-threading.Thread(target=scheduler, daemon=True).start()
-
-# ========== FINAL POLLING LOOP - ANTI CONFLICT ==========
-print("V11.6 polling - single instance anti-conflict")
+threading.Thread(target=scheduler,daemon=True).start()
+print("V11.8 polling")
 while True:
-    try:
-        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
-    except Exception as e:
-        print(f"Polling crashed {e} - retry in 10s")
-        time.sleep(10)
+    try: bot.infinity_polling(skip_pending=True,timeout=30,long_polling_timeout=30)
+    except Exception as e: print(f"Poll {e}"); time.sleep(10)
