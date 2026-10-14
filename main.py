@@ -1,4 +1,4 @@
-import os, time, threading, requests, sqlite3, socket
+qimport os, time, threading, requests, sqlite3, socket
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import telebot
@@ -360,9 +360,43 @@ def scheduler():
         time.sleep(30)
 
 threading.Thread(target=scheduler,daemon=True).start()
-print("V15.4 FINAL LOCKED polling — single instance")
-while True:
+from flask import request
+
+@app.route(f'/{TOKEN}', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    return 'KO', 403
+
+@app.route('/setwebhook')
+def set_webhook():
+    bot.remove_webhook()
+    time.sleep(1)
+    # Set webhook to your Render URL
+    url = f"{RENDER_URL}/{TOKEN}"
+    bot.set_webhook(url=url, drop_pending_updates=True)
+    return f"Webhook set to {url} OK"
+
+@app.route('/')
+def home():
+    return "V15.4 WEBHOOK LIVE"
+
+# On start, set webhook once
+def init_webhook():
+    time.sleep(3)
     try:
-        bot.infinity_polling(skip_pending=True,timeout=30,long_polling_timeout=30)
+        if RENDER_URL:
+            bot.remove_webhook()
+            time.sleep(2)
+            bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}", drop_pending_updates=True)
+            print(f"✅ WEBHOOK SET: {RENDER_URL}/{TOKEN}")
     except Exception as e:
-        print(f"Poll {e}"); time.sleep(10)
+        print(f"Webhook set fail {e}")
+
+threading.Thread(target=init_webhook, daemon=True).start()
+
+# Keep app running - NO infinity_polling
+print("V15.4 WEBHOOK MODE - No polling - No 409")
