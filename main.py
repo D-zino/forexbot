@@ -1,5 +1,6 @@
 import os, time, threading, requests, sqlite3, json, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from collections import OrderedDict
 from zoneinfo import ZoneInfo
 import telebot
 from flask import Flask, request
@@ -13,17 +14,52 @@ PORT=int(os.getenv("PORT",10000))
 RENDER_URL=os.getenv("RENDER_EXTERNAL_URL","https://forexbot-44io.onrender.com")
 app=Flask(__name__)
 @app.route('/')
-def home(): return "V16.2 COMPLETE WEBHOOK TRUE LIVE OK"
+def home(): return "V17.0 COMPLETE WEBHOOK TRUE LIVE OK"
 @app.route('/health')
 def health(): return "OK"
 bot=telebot.TeleBot(TOKEN,parse_mode="HTML",threaded=False)
-# ============ WEBHOOK  FIXES 409 CONFLICT PERMANENTLY ============
+# ============ WEBHOOK - FIXES 409 CONFLICT PERMANENTLY ============
+# V17.0 FIX: a slow handler used to hold the HTTP response open until Telegram timed out,
+# so Telegram REDELIVERED the same update - which is why /brief repeated every minute.
+# Now: ACK immediately, process in a worker thread, and ignore duplicate update_ids.
+_update_seen=OrderedDict()
+_update_lock=threading.Lock()
+_update_workers=0
+
+def _run_update(update):
+    global _update_workers
+    try:
+        bot.process_new_updates([update])
+    except Exception as e:
+        print(f"update {getattr(update,'update_id',None)} failed: {e}")
+    finally:
+        with _update_lock:
+            _update_workers=max(0,_update_workers-1)
+
+def _enqueue_update(update):
+    """Dedupe by update_id (Telegram retries redeliver the same id) and run off the webhook thread."""
+    global _update_workers
+    uid=getattr(update,'update_id',None)
+    with _update_lock:
+        if uid is not None and uid in _update_seen:
+            print(f"V17.0: duplicate update {uid} ignored (Telegram redelivery)")
+            return False
+        if uid is not None:
+            _update_seen[uid]=time.time()
+            while len(_update_seen)>400: _update_seen.popitem(last=False)
+        if _update_workers>=4:
+            print("V17.0: update worker limit reached - update dropped")
+            return False
+        _update_workers+=1
+    threading.Thread(target=_run_update,args=(update,),daemon=True).start()
+    return True
+
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
+        _enqueue_update(update)
         return 'OK', 200
     return 'KO', 403
 @app.route('/setwebhook')
@@ -119,6 +155,9 @@ class DB:
     @staticmethod
     def _pg_sql(sql):
         s=sql.strip()
+        if s.startswith("REPLACE INTO levels"):
+            s=s.replace("REPLACE INTO levels","INSERT INTO levels",1).replace("?","%s")
+            return s+" ON CONFLICT (lkey) DO UPDATE SET low=EXCLUDED.low, high=EXCLUDED.high, ts=EXCLUDED.ts, status=EXCLUDED.status, note=EXCLUDED.note"
         if s.startswith("REPLACE INTO probables"):
             s=s.replace("REPLACE INTO probables","INSERT INTO probables",1).replace("?","%s")
             return s+" ON CONFLICT (pair) DO UPDATE SET time=EXCLUDED.time, fvg_low=EXCLUDED.fvg_low, fvg_high=EXCLUDED.fvg_high, bias=EXCLUDED.bias, stage=EXCLUDED.stage"
@@ -146,13 +185,14 @@ class DB:
         self.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, pair TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL, bias TEXT, time TEXT, result TEXT, pips REAL, stage TEXT)")
         self.execute("CREATE TABLE IF NOT EXISTS probables (pair TEXT PRIMARY KEY, time TEXT, fvg_low REAL, fvg_high REAL, bias TEXT, stage TEXT)")
         self.execute("CREATE TABLE IF NOT EXISTS steps (pair TEXT PRIMARY KEY, sweep INTEGER, choch INTEGER, fvg INTEGER, confirm INTEGER, last_time TEXT)")
+        self.execute("CREATE TABLE IF NOT EXISTS levels (lkey TEXT PRIMARY KEY, pair TEXT, kind TEXT, low REAL, high REAL, ts TEXT, status TEXT, note TEXT)")
         self.commit()
 conn=DB()
 FALLBACK={"EUR/USD":1.11932,"GBP/USD":1.32661,"USD/CAD":1.4210,"EUR/JPY":177.53,"USD/JPY":158.44,"XAU/USD":4143.74,"NAS100":30568.90,"US30":51765.50,"GERMANY40":25403.0,"DXY":102.10,"WTI":106.0}
 YAHOO_MAP={"EUR/USD":"EURUSD=X","GBP/USD":"GBPUSD=X","USD/CAD":"USDCAD=X","EUR/JPY":"EURJPY=X","USD/JPY":"USDJPY=X","XAU/USD":"GC=F","NAS100":"NQ=F","US30":"YM=F","GERMANY40":"^GDAXI","DXY":"DX-Y.NYB","WTI":"CL=F"}
 PAIRS_9=["EUR/USD","GBP/USD","USD/CAD","XAU/USD","EUR/JPY","USD/JPY","NAS100","US30","GERMANY40"]
 # =====================================================================
-# [OK] V16.2  CANDLE SOURCE THAT WORKS FROM A DATACENTER IP (and from Nigeria)
+# [OK] V17.0  CANDLE SOURCE THAT WORKS FROM A DATACENTER IP (and from Nigeria)
 # Deriv's public market-data WebSocket needs NO login, NO KYC and no funded
 # account  verified live: real 5m/15m/1h candles for all 9 pairs.
 # Only a candle SOURCE changed; FVG / OB / CHOCH / sweep logic is untouched.
@@ -163,14 +203,16 @@ CANDLE_SOURCE=os.getenv("CANDLE_SOURCE","deriv").lower()
 DERIV_MAP={"EUR/USD":"frxEURUSD","GBP/USD":"frxGBPUSD","USD/CAD":"frxUSDCAD","EUR/JPY":"frxEURJPY",
            "USD/JPY":"frxUSDJPY","XAU/USD":"frxXAUUSD","NAS100":"OTC_NDX","US30":"OTC_DJI","GERMANY40":"OTC_GDAXI"}
 #                 granularity(sec), cache TTL(sec)
-CANDLE_TF={"5m":(300,45),"15m":(900,180),"60m":(3600,900),"4h":(14400,900)}
-YF_INTERVAL={"5m":"5m","15m":"15m","60m":"60m","4h":"1h"}     # Yahoo has no 4h -> 1h
-YF_RANGE={"5m":"2d","15m":"5d","60m":"10d","4h":"1mo"}
+CANDLE_TF={"1m":(60,1800),"5m":(300,45),"15m":(900,180),"60m":(3600,900),"4h":(14400,900)}
+CANDLE_COUNT={"1m":3000}                      # 1m: ~50h so the WHOLE previous UTC day is covered
+YF_INTERVAL={"1m":"1m","5m":"5m","15m":"15m","60m":"60m","4h":"1h"}   # Yahoo has no 4h -> 1h
+YF_RANGE={"1m":"2d","5m":"2d","15m":"5d","60m":"10d","4h":"1mo"}
 _CANDLE_CACHE={}
 _hold_sent={}                                   # pair -> event key already warned about                                   # (pair,interval) -> (ts, candles, source)
 _LAST_SRC={}                                       # (pair,interval) -> "DERIV"/"YAHOO"/"EMPTY"
 _deriv={"ws":None,"lock":threading.Lock(),"req":0,"fails":0,"fail_until":0.0}
-def get_deriv_candles(pair, interval="15m", count=120):
+def get_deriv_candles(pair, interval="15m", count=None):
+    count=count or CANDLE_COUNT.get(interval,120)
     """One shared socket, JSON request/response by req_id. Returns [] on any failure."""
     if CANDLE_SOURCE=="yahoo": return []
     sym=DERIV_MAP.get(pair)
@@ -362,7 +404,7 @@ def get_live_all_live():
         if k not in data:
             print(f"\u26a0\ufe0f FALLBACK USED {k}: {v}")
             data[k]=v
-    print(f"FINAL TRUE LIVE V16.2: {data}")
+    print(f"FINAL TRUE LIVE V17.0: {data}")
     return data
 def calc_pips(pair, entry, current, bias):
     # [OK] FIX: only 4-decimal FX pairs use 10000. XAU/USD contains "/" but is quoted in
@@ -371,7 +413,7 @@ def calc_pips(pair, entry, current, bias):
     elif pair in ("EUR/USD","GBP/USD","USD/CAD"): mult=10000
     else: mult=1
     return (current-entry)*mult if bias=="BUY" else (entry-current)*mult
-# [OK] FIX (V16.2): step 1 was mathematically broken for every instrument.
+# [OK] FIX (V17.0): step 1 was mathematically broken for every instrument.
 #    Old code: sweep = live0.0010, then checked abs(live - sweep) < 0.0020.
 #       FX majors: 0.0010 < 0.0020 is ALWAYS true  3 false SWEEP alerts at every killzone open.
 #       JPY/gold/indices: distance was 0.30 / 7.0 / 70  could NEVER fire.
@@ -417,24 +459,37 @@ def htf_poi(pair, fb_low, fb_high):
         ob=find_ob_typed(candles_cached(pair, tf))
         if ob: return {'low':ob['low'],'high':ob['high'],'type':ob['type'],'tf':label}
     return {'low':fb_low,'high':fb_high,'type':'SYNTH','tf':'SYNTH'}
-def asia_range(pair):
-    """Asian-session high/low (00:00-07:00 UTC = 01:00-08:00 WAT) from timed 15m candles."""
+def asia_session(pair, now=None):
+    """Return the most recent COMPLETED Asia range (00:00-07:00 UTC) and its date.
+
+    Before 07:00 UTC, today's range is still forming, so keep using the last completed
+    session. A candidate day must include the final 15m bar (06:45) and at least 20 bars;
+    partial candles must not be frozen as the day's high/low.
+    """
     try:
-        c=candles_cached(pair, "15m")
-        if not c: return None
-        times=[x.get('time') for x in c if x.get('time')]
-        if not times: return None
-        day=datetime.fromtimestamp(max(times), timezone.utc).date()
-        hi=None; lo=None
+        c=candles_cached(pair,"15m")
+        if not c: return None,None
+        now=now or datetime.now(timezone.utc)
+        cutoff=now.date() if (now.hour,now.minute)>=(7,0) else now.date()-timedelta(days=1)
+        by_day={}
         for x in c:
-            t=x.get('time')
+            t=x.get("time")
             if not t: continue
-            d=datetime.fromtimestamp(t, timezone.utc)
-            if d.date()!=day or d.hour>=7: continue
-            hi=x['high'] if hi is None else max(hi,x['high'])
-            lo=x['low'] if lo is None else min(lo,x['low'])
-        return (hi,lo) if hi is not None else None
-    except: return None
+            d=datetime.fromtimestamp(t,timezone.utc)
+            if d.date()<=cutoff and d.hour<7:
+                by_day.setdefault(d.date(),[]).append((d,x))
+        for day in sorted(by_day,reverse=True):
+            rows=by_day[day]
+            if len(rows)<20: continue
+            last=max(dt for dt,x in rows)
+            if (last.hour,last.minute)<(6,45): continue
+            return (max(x["high"] for dt,x in rows),min(x["low"] for dt,x in rows)),day.isoformat()
+        return None,None
+    except: return None,None
+
+def asia_range(pair):
+    """High/low of the most recent completed Asia session (00:00-07:00 UTC)."""
+    return asia_session(pair)[0]
 def sweep_label(pair, level, bias):
     """Name the liquidity that got swept, honestly: Asia high/low if it matches, else swing."""
     tol=sweep_tol(pair); a=asia_range(pair)
@@ -442,50 +497,284 @@ def sweep_label(pair, level, bias):
         if abs(level-a[0]) <= tol*2: return "Asia high"
         if abs(level-a[1]) <= tol*2: return "Asia low"
     return "swing high" if bias=="SELL" else "swing low"
+# =====================================================================
+# V17.0 - PD ARRAYS THAT PERSIST UNTIL INVALIDATED
+#  Every level is derived from a FIXED reference window, written to the levels
+#  table ONCE, and re-derived only when it is invalidated. That is why the FVG /
+#  POC / sweep numbers no longer change every minute.
+#    PDH / PDL   prev UTC day high / low      - invalidated when SWEPT (traded through)
+#    ASIA_H / L  00:00-07:00 UTC extremes     - invalidated when SWEPT
+#    POC         prev day TPO profile (1m)    - recomputed once per day
+#    FVG         nearest unmitigated gap in the bias direction
+#                - invalidated when a candle CLOSES beyond its far edge
+#    OB          4H order block (1H fallback) - invalidated on a close beyond it,
+#                and it then becomes a BREAKER (polarity flip)
+#    BREAKER     failed OB; kept until the zone fails (close through it again)
+#  NOTE on POC: spot FX has no central volume feed, so a true volume POC is not
+#  obtainable. This is a time-at-price POC (TPO) from previous-day 1m candles -
+#  labelled as such rather than pretending to be volume profile.
+# =====================================================================
+def _lvl_row(pair, kind):
+    return conn.execute("SELECT low,high,ts,status,note FROM levels WHERE lkey=?",(f"{pair}|{kind}",)).fetchone()
+
+def lvl_rows(pair):
+    return conn.execute("SELECT kind,low,high,ts,status,note FROM levels WHERE pair=?",(pair,)).fetchall()
+
+def lvl_set(pair, kind, low, high, note="", status="ACTIVE", force=False):
+    """Write the level once. An ACTIVE level is never silently overwritten (that was the bug)."""
+    row=_lvl_row(pair,kind)
+    if row and row[3]=="ACTIVE" and not force: return False
+    conn.execute("REPLACE INTO levels VALUES (?,?,?,?,?,?,?,?)",
+                 (f"{pair}|{kind}",pair,kind,low,high,datetime.now(WAT).strftime("%a %H:%M"),status,note))
+    conn.commit(); return True
+
+def lvl_status(pair, kind, status, note=""):
+    # Keep the source-day marker when status changes; it prevents the next refresh
+    # from mistaking a swept level for a new reference and reactivating it.
+    row=conn.execute("SELECT note FROM levels WHERE lkey=?",(f"{pair}|{kind}",)).fetchone()
+    old_note=(row[0] or "") if row else ""
+    tag=re.search(r"\[source-day=\d{4}-\d{2}-\d{2}\]",old_note)
+    if tag and tag.group(0) not in note:
+        note=(note+" "+tag.group(0)).strip()
+    conn.execute("UPDATE levels SET status=?, note=? WHERE lkey=?",(status,note,f"{pair}|{kind}")); conn.commit()
+
+def utc_day_start(back=0):
+    now=datetime.now(timezone.utc); d=(now-timedelta(days=back)).date()
+    return datetime(d.year,d.month,d.day,tzinfo=timezone.utc)
+
+def prev_day_extremes(pair):
+    c=candles_cached(pair,"15m")
+    if not c: return None
+    s0=utc_day_start(1); e0=s0+timedelta(days=1)
+    rows=[x for x in c if x.get("time") and s0.timestamp()<=x["time"]<e0.timestamp()]
+    if len(rows)<10: return None
+    return max(x["high"] for x in rows), min(x["low"] for x in rows)
+
+def prev_day_poc(pair, bins=60):
+    """Previous-day POC by time-at-price (TPO) from 1m candles: each candle contributes
+    one unit spread across the price bins it covers. No volume feed exists for spot FX."""
+    c=candles_cached(pair,"1m")
+    if not c: return None
+    s0=utc_day_start(1); e0=s0+timedelta(days=1)
+    rows=[x for x in c if x.get("time") and s0.timestamp()<=x["time"]<e0.timestamp()]
+    if len(rows)<60: return None
+    lo=min(x["low"] for x in rows); hi=max(x["high"] for x in rows)
+    if hi<=lo: return None
+    size=(hi-lo)/bins; counts=[0.0]*bins
+    for x in rows:
+        a=max(0,min(bins-1,int((x["low"]-lo)/size))); b=max(0,min(bins-1,int((x["high"]-lo)/size)))
+        w=1.0/(b-a+1)
+        for i in range(a,b+1): counts[i]+=w
+    k=counts.index(max(counts))
+    return lo+(k+0.5)*size
+
+def _dated_level_set(pair, kind, low, high, note, source_day):
+    """Keep one level for a reference day; never revive/rewrite it within that day.
+
+    A date tag lets the level roll forward at the UTC boundary without reviving a
+    swept PDH/PDL or carrying yesterday's POC/Asia range into today's brief.
+    """
+    tag=f"[source-day={source_day}]"
+    row=_lvl_row(pair,kind)
+    if row and tag in (row[4] or ""):
+        return False
+    if low is None or high is None:
+        if row:
+            lvl_status(pair,kind,"STALE",f"reference data unavailable for {source_day}")
+        return False
+    return lvl_set(pair,kind,low,high,f"{note} {tag}",force=True)
+
+def refresh_levels(pair, live, bias, c5=None, c15=None):
+    """Derive levels from fixed UTC reference windows; roll daily levels once per UTC day."""
+    prev_day=utc_day_start(1).date().isoformat()
+    ext=prev_day_extremes(pair)
+    _dated_level_set(pair,"PDH",ext[0] if ext else None,ext[0] if ext else None,
+                     "previous UTC day high",prev_day)
+    _dated_level_set(pair,"PDL",ext[1] if ext else None,ext[1] if ext else None,
+                     "previous UTC day low",prev_day)
+    poc=prev_day_poc(pair)
+    _dated_level_set(pair,"POC",poc,poc,"prev-day TPO (1m time-at-price)",prev_day)
+    a,asia_day=asia_session(pair)
+    if a and asia_day:
+        _dated_level_set(pair,"ASIA_HIGH",a[0],a[0],"Asia high (00-07 UTC)",asia_day)
+        _dated_level_set(pair,"ASIA_LOW",a[1],a[1],"Asia low (00-07 UTC)",asia_day)
+
+def levels_check(pair, live, bias, c5, c15):
+    """Invalidate what the market has actually taken out. Nothing else changes."""
+    # --- liquidity swept?
+    for kind,up in (("PDH",True),("ASIA_HIGH",True),("PDL",False),("ASIA_LOW",False)):
+        r=_lvl_row(pair,kind)
+        if not r or r[3]!="ACTIVE": continue
+        lvl=r[1] if up else r[0]
+        if (up and live>=lvl) or ((not up) and live<=lvl):
+            lvl_status(pair,kind,"SWEPT",f"swept, price reached {px(pair,live)}")
+    # --- persisted swing liquidity (when no daily level was available)
+    r=_lvl_row(pair,"SWEEP")
+    if r and r[3]=="ACTIVE":
+        up=("SELL" in (r[4] or ""))
+        lvl=r[1] if up else r[0]
+        if (up and live>=lvl) or ((not up) and live<=lvl):
+            lvl_status(pair,"SWEEP","SWEPT",f"swept, price reached {px(pair,live)}")
+    # --- FVG / OB mitigation: a CLOSE beyond the far edge invalidates the array
+    for kind in ("FVG","OB"):
+        r=_lvl_row(pair,kind)
+        if not r or r[3]!="ACTIVE": continue
+        low,high,ts,status,note=r
+        bull = ("BUY" in (note or "")) or ("Bullish" in (note or "")) or ("BULL" in (note or ""))
+        for x in (c5 or [])[-12:]:
+            if bull and x["close"]<low:
+                lvl_status(pair,kind,"MITIGATED",f"closed below {px(pair,low)}")
+                if kind=="OB":
+                    lvl_set(pair,"BREAKER",low,high,f"bearish breaker from Bullish OB {ts}",force=True)
+                break
+            if (not bull) and x["close"]>high:
+                lvl_status(pair,kind,"MITIGATED",f"closed above {px(pair,high)}")
+                if kind=="OB":
+                    lvl_set(pair,"BREAKER",low,high,f"bullish breaker from Bearish OB {ts}",force=True)
+                break
+    # --- breaker: retested (still valid) or failed. A bearish breaker (failed Bullish OB)
+    #     dies on a CLOSE back above the zone; a bullish breaker dies on a close below it -
+    #     the candle that created it is expected to sit on the broken side.
+    r=_lvl_row(pair,"BREAKER")
+    if r and r[3]=="ACTIVE":
+        low,high=r[0],r[1]
+        note=r[4] or ""
+        bear=("bearish breaker" in note)
+        if live>=low and live<=high and not note.startswith("retested"):
+            lvl_status(pair,"BREAKER","ACTIVE",f"{note.split(' from')[0]}, retested {datetime.now(WAT).strftime('%a %H:%M')}")
+        for x in (c5 or [])[-12:]:
+            if (bear and x["close"]>high) or ((not bear) and x["close"]<low):
+                lvl_status(pair,"BREAKER","FAILED",f"closed back {'above' if bear else 'below'} the zone")
+                break
+
+def active_fvg(pair, bias, c5, c15):
+    """Nearest unmitigated imbalance in the bias direction, persisted until mitigated."""
+    r=_lvl_row(pair,"FVG")
+    if r and r[3]=="ACTIVE" and (r[4] or "").startswith(bias):
+        return r[0],r[1],True,r[2],r[4]
+    if r and r[3]=="ACTIVE":
+        lvl_status(pair,"FVG","SUPERSEDED","bias flipped")
+    f=find_real_fvg(c15,bias) if c15 else None
+    if not f: f=find_real_fvg(c5,bias) if c5 else None
+    if not f: return None,None,False,None,None
+    lvl_set(pair,"FVG",f["low"],f["high"],f"{bias} {f['type']} FVG",force=True)
+    rr=_lvl_row(pair,"FVG")
+    return rr[0],rr[1],True,rr[2],rr[4]
+
+def active_ob(pair, live, bias):
+    """Bias-aligned 4H/1H order block, persisted until mitigated."""
+    want="Bullish" if bias=="BUY" else "Bearish"
+    r=_lvl_row(pair,"OB")
+    if r and r[3]=="ACTIVE" and want in (r[4] or ""):
+        return r[0],r[1],True,r[2],r[4]
+    htf=htf_poi(pair, live-0.001, live+0.001)
+    if htf and htf.get("tf")!="SYNTH" and htf.get("type")==want:
+        lvl_set(pair,"OB",htf["low"],htf["high"],f"{htf['tf']} {htf['type']} OB",force=True)
+        rr=_lvl_row(pair,"OB")
+        return rr[0],rr[1],True,rr[2],rr[4]
+    return (htf["low"] if htf else live),(htf["high"] if htf else live),False,None,"SYNTH"
+
+def next_liquidity(pair, live, bias, c5=None):
+    """Nearest UNTAPPED liquidity the setup should run: PDH/Asia high above for a SELL,
+    PDL/Asia low below for a BUY. Falls back to the swing level when none is stored."""
+    cands=[]
+    kinds=(("PDH","PDH"),("ASIA_HIGH","Asia high")) if bias=="SELL" else (("PDL","PDL"),("ASIA_LOW","Asia low"))
+    for kind,label in kinds:
+        r=_lvl_row(pair,kind)
+        if not r or r[3]!="ACTIVE": continue
+        lvl=r[1] if bias=="SELL" else r[0]
+        d=(lvl-live) if bias=="SELL" else (live-lvl)
+        if d<=0: continue
+        cands.append((d,lvl,label))
+    if cands:
+        d,lvl,label=sorted(cands)[0]
+        return lvl,f"{label} (untapped)",True
+    # --- no daily level stored: the swing liquidity is persisted too, so it cannot
+    #     drift while the candle window slides. It is only re-derived once price has
+    #     traded through it (i.e. it has been swept).
+    r=_lvl_row(pair,"SWEEP")
+    if r and r[3]=="ACTIVE":
+        lvl=r[1] if bias=="SELL" else r[0]
+        if (bias=="SELL" and lvl>=live) or (bias=="BUY" and lvl<=live):
+            return lvl,("swing high" if bias=="SELL" else "swing low"),True
+        lvl_status(pair,"SWEEP","SWEPT",f"swept, price reached {px(pair,live)}")
+    lvl,real=sweep_level(pair,live,bias,c5)
+    if real:
+        lvl_set(pair,"SWEEP",lvl,lvl,("SELL swing high" if bias=="SELL" else "BUY swing low"))
+    return lvl,("swing high" if bias=="SELL" else "swing low"),real
+
+def ote_band(pair, bias, c5):
+    """Classic OTE: the 62-79% retracement of the last impulse leg (not the FVG midpoint)."""
+    if not c5 or len(c5)<12: return None,None
+    win=c5[-30:]
+    hi=max(x["high"] for x in win); lo=min(x["low"] for x in win); R=hi-lo
+    if R<=0: return None,None
+    if bias=="BUY": return hi-0.79*R, hi-0.62*R
+    return lo+0.62*R, lo+0.79*R
+
+def stop_and_targets(pair, live, bias, zone_low, zone_high):
+    """SL beyond the POI zone; TP1 at the nearest opposing untapped liquidity, TP2 at the next."""
+    tol=sweep_tol(pair); buf=2*tol
+    if bias=="BUY":
+        sl=(zone_low if zone_low is not None else live)-buf
+        tg=[]
+        for kind in ("PDH","ASIA_HIGH"):
+            r=_lvl_row(pair,kind)
+            if r and r[3]=="ACTIVE" and r[1]>live+2*buf: tg.append(r[1])
+        tg.sort()
+        tp1=tg[0] if tg else live+2*(live-sl)
+        tp2=tg[1] if len(tg)>1 else live+2*(tp1-live)
+    else:
+        sl=(zone_high if zone_high is not None else live)+buf
+        tg=[]
+        for kind in ("PDL","ASIA_LOW"):
+            r=_lvl_row(pair,kind)
+            if r and r[3]=="ACTIVE" and r[0]<live-2*buf: tg.append(r[0])
+        tg.sort(reverse=True)
+        tp1=tg[0] if tg else live-2*(sl-live)
+        tp2=tg[1] if len(tg)>1 else live-2*(live-tp1)
+    return sl,tp1,tp2
+
 def build_pair(pair, live):
-    c15=candles_cached(pair, "15m"); c5=candles_cached(pair, "5m"); c1h=candles_cached(pair, "60m")
-    time.sleep(0.15)
-    real_fvg=None                      # chosen after the bias is known (see below)
-    real_ob=find_real_ob(c1h) if c1h else None
+    c15=candles_cached(pair, "15m"); c5=candles_cached(pair, "5m")
     choch=find_choch(c15) if c15 else None
     if choch=="BULL_CHOCHO": bias="BUY"
     elif choch=="BEAR_CHOCHO": bias="SELL"
     else: bias="SELL" if pair in ["EUR/USD","GBP/USD","XAU/USD"] else "BUY"
-    real_fvg=find_real_fvg(c5, bias) if c5 else None   # bias-aligned imbalance
-    if real_fvg: fvg_low,fvg_high=real_fvg['low'],real_fvg['high']
-    else:
+
+    refresh_levels(pair, live, bias, c5, c15)      # derive once ...
+    levels_check(pair, live, bias, c5, c15)        # ... invalidate only what the market took
+
+    fvg_low,fvg_high,real_fvg,fvg_ts,fvg_note=active_fvg(pair, bias, c5, c15)
+    if not real_fvg:                               # synthetic fallback so the brief always has a zone
         if pair in ["EUR/USD","GBP/USD","USD/CAD"]: fvg_low,fvg_high=live-0.0010,live+0.0008
         elif "JPY" in pair: fvg_low,fvg_high=live-0.20,live+0.15
         elif pair=="XAU/USD": fvg_low,fvg_high=live-4.0,live+4.0
         else: fvg_low,fvg_high=live-80,live+30
-    if real_ob: ht_low,ht_high=real_ob['low'],real_ob['high']
-    else:
-        if pair in ["EUR/USD","GBP/USD","USD/CAD"]: ht_low,ht_high=live-0.0025,live+0.0020
-        elif "JPY" in pair: ht_low,ht_high=live-0.50,live+0.40
-        elif pair=="XAU/USD": ht_low,ht_high=live-10.0,live+12.0
-        else: ht_low,ht_high=live-120,live+80
-    sweep, real_sweep = sweep_level(pair, live, bias, c5)   # [OK] real liquidity from candles
-    if pair in ["EUR/USD","GBP/USD","USD/CAD"]:
-        breaker=live+0.0005; entry=live; poc=live; ote=(fvg_low+fvg_high)/2
-        sl=live-0.0024 if bias=="BUY" else live+0.0020; tp1=live+0.0020 if bias=="BUY" else live-0.0015; tp2=live+0.0040 if bias=="BUY" else live-0.0030; zone_low,zone_high=live+0.0005,live+0.0015
-    elif "JPY" in pair:
-        breaker=live+0.20; entry=live; poc=live; ote=(fvg_low+fvg_high)/2; sl=live-0.62; tp1=live+0.30; tp2=live+0.60; zone_low,zone_high=live+0.20,live+0.40
-    elif pair=="XAU/USD":
-        breaker=live-6.0 if bias=="SELL" else live+6.0; entry=live; poc=live; ote=(fvg_low+fvg_high)/2; sl=live+12.0 if bias=="SELL" else live-12.0; tp1=live-3.0 if bias=="SELL" else live+8.0; tp2=live-8.0 if bias=="SELL" else live+15.0; zone_low,zone_high=live-8.0,live-6.0
-    else:
-        breaker=live+65; entry=live; poc=live; ote=(fvg_low+fvg_high)/2; sl=live-80; tp1=live+60; tp2=live+150; zone_low,zone_high=live+50,live+90
-    htf=htf_poi(pair, ht_low, ht_high)
-    ar=asia_range(pair)
-    return {"fvg_type":(real_fvg['type'] if real_fvg else ("BEAR" if bias=="SELL" else "BULL")),"htf_low":htf['low'],"htf_high":htf['high'],"htf_type":htf['type'],"htf_tf":htf['tf'],"asia_hi":(ar[0] if ar else None),"asia_lo":(ar[1] if ar else None),"sweep_label":sweep_label(pair, sweep, bias),"live":live,"bias":bias,"fvg_low":fvg_low,"fvg_high":fvg_high,"ht_low":ht_low,"ht_high":ht_high,"sweep":sweep,"breaker":breaker,"entry":entry,"poc":poc,"ote":ote,"sl":sl,"tp1":tp1,"tp2":tp2,"zone_low":zone_low,"zone_high":zone_high,"real_sweep":real_sweep,"choch":choch or "WAIT","real_fvg":real_fvg is not None,"real_ob":real_ob is not None}
-# =====================================================================
-# V16.2 - FREE NEWS + ECONOMIC CALENDAR. No API key, no signup.
-#   Calendar : Forex Factory community JSON (impact, forecast, previous, time)
-#   Headlines: Investing.com RSS (forex + economy)
-#   Honest scope: this does NOT predict direction. It (a) stops the bot firing an
-#   ENTRY into a high-impact release, and (b) replaces generic 'justification' text
-#   with the actual next event for that pair's currencies.
-#   Env: NEWS_FILTER=off disables the entry blackout | NEWS_BLACKOUT_MIN=15
-# =====================================================================
+    ob_low,ob_high,real_ob,ob_ts,ob_note=active_ob(pair, live, bias)
+    brk=_lvl_row(pair,"BREAKER")
+    breaker=((brk[0]+brk[1])/2) if brk else None
+    poc_row=_lvl_row(pair,"POC")
+    # Never substitute the live quote for a previous-day POC. If data is missing
+    # or the stored POC belongs to a prior UTC day, show unavailable instead.
+    poc=poc_row[0] if poc_row and poc_row[3]=="ACTIVE" else None
+    sweep,sweep_label,real_sweep=next_liquidity(pair, live, bias, c5)
+    ote_low,ote_high=ote_band(pair, bias, c5)
+    ote=((ote_low+ote_high)/2) if (ote_low is not None and ote_high is not None) else (fvg_low+fvg_high)/2
+    zone_low,zone_high=fvg_low,fvg_high
+    sl,tp1,tp2=stop_and_targets(pair, live, bias, zone_low, zone_high)
+
+    return {"live":live,"bias":bias,
+            "fvg_low":fvg_low,"fvg_high":fvg_high,"real_fvg":real_fvg,"fvg_ts":fvg_ts,"fvg_note":fvg_note,
+            "fvg_type":(fvg_note.split()[1] if (fvg_note and len(fvg_note.split())>1) else ("BEAR" if bias=="SELL" else "BULL")),
+            "ht_low":ob_low,"ht_high":ob_high,"real_ob":real_ob,"ob_ts":ob_ts,"ob_note":ob_note,
+            "htf_low":ob_low,"htf_high":ob_high,"htf_type":("Bullish" if bias=="BUY" else "Bearish"),
+            "htf_tf":("4H" if real_ob else "SYNTH"),
+            "sweep":sweep,"sweep_label":sweep_label,"real_sweep":real_sweep,
+            "breaker":breaker,"poc":poc,"ote":ote,"ote_low":ote_low,"ote_high":ote_high,
+            "entry":live,"sl":sl,"tp1":tp1,"tp2":tp2,
+            "zone_low":zone_low,"zone_high":zone_high,
+            "choch":choch or "WAIT"}
 NEWS_CAL_URL=os.getenv("NEWS_CAL_URL","https://nfs.faireconomy.media/ff_calendar_thisweek.json")
 NEWS_RSS_URL=os.getenv("NEWS_RSS_URL","https://www.investing.com/rss/news_1.rss")
 NEWS_CSV_URL=os.getenv("NEWS_CSV_URL","https://nfs.faireconomy.media/ff_calendar_thisweek.csv")
@@ -645,7 +934,7 @@ def generate_full():
                f"NAS100 {nas:.2f} | US30 {us30:.2f} | GER40 {ger:.2f} - all LIVE"
                + (f" | {news}" if news else ""))
 
-    txt=f"<b>\U0001f4ca 9 PAIRS - FULL ICT BRIEF {now.strftime('%a %b %d %I:%M %p')} WAT - V16.2</b>\n"
+    txt=f"<b>\U0001f4ca 9 PAIRS - FULL ICT BRIEF {now.strftime('%a %b %d %I:%M %p')} WAT - V17.0</b>\n"
     txt+="Candles: Deriv public feed (real FVG/OB/CHOCH) | Prices: er-api, gold-api, stooq\n"
     txt+=f"<b>HEADLINES:</b> {headlines}\n"
     ev=day_events(3)
@@ -655,6 +944,11 @@ def generate_full():
           f"<b>Entry blackout:</b> {NEWS_BLACKOUT_MIN} min either side of a high-impact release (NEWS_FILTER={'ON' if NEWS_FILTER else 'OFF'})\n\n"
           "<b>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</b>\n\n")
 
+    def lvl_txt(pair, kind):
+        r=_lvl_row(pair,kind)
+        if not r: return "-"
+        return f"{px(pair,r[1] if kind.endswith('H') else r[0])}" + ("" if r[3]=="ACTIVE" else f" ({r[3].lower()})")
+
     pairs=[("EUR/USD","\U0001f4b6"),("GBP/USD","\U0001f4b7"),("USD/CAD","\U0001f341"),("XAU/USD","\U0001f3c6"),
            ("EUR/JPY","\U0001f4b6"),("USD/JPY","\U0001f4b4"),("NAS100","\U0001f4c8"),("US30","\U0001f4c8"),("GERMANY40","\U0001f1e9\U0001f1ea")]
     for i,(pair,emoji) in enumerate(pairs,1):
@@ -663,6 +957,9 @@ def generate_full():
         row=conn.execute("SELECT sweep, choch, fvg, confirm FROM steps WHERE pair=?",(pair,)).fetchone() or (0,0,0,0)
         s1,s2,s3,s4=[int(x) for x in row]
         bias=c['bias']
+        _poc=_lvl_row(pair,"POC")
+        poc_txt=(_poc[4] if _poc and _poc[3]=="ACTIVE" else "prev-day TPO unavailable (previous UTC day data missing or insufficient)")
+        poc_display=px(pair,c["poc"]) if c["poc"] is not None else "unavailable"
         if s4:   status="\u2705 IN TRADE - journaled"
         elif s3: status="\u26a0\ufe0f WAIT for confirmation (5m CHOCH)"
         elif s2: status="\u26a0\ufe0f WAIT for FVG retest"
@@ -671,20 +968,24 @@ def generate_full():
         fvg_tag="REAL" if c['real_fvg'] else "SYNTH"
         ob_tag="REAL" if c['real_ob'] else "SYNTH"
         swp_tag="REAL" if c['real_sweep'] else "SYNTH"
+        ote_display=(f"{px(pair,c['ote_low'])}-{px(pair,c['ote_high'])}"
+                     if c['ote_low'] is not None and c['ote_high'] is not None else "unavailable")
         htf_txt=(f"{c['htf_tf']} {c['htf_type']} OB {px(pair,c['htf_low'])}-{px(pair,c['htf_high'])}"
                  if c['htf_tf']!="SYNTH" else f"SYNTH zone {px(pair,c['htf_low'])}-{px(pair,c['htf_high'])}")
         txt+=(f"{emoji} <b>{i}) {pair} - Current {px(pair,live)} - DXY {dxy:.2f}</b>\n"
               f"Bias: {bias}{' after sweep' if s1 else ''} | Live Price: {px(pair,live)}\n"
               f"HTF POI: {htf_txt}\n"
-              f"FVG: {px(pair,c['fvg_low'])}-{px(pair,c['fvg_high'])} ({fvg_tag}, {c['fvg_type']})\n"
-              f"Liquidity: Sweep {px(pair,c['sweep'])} ({c['sweep_label']}, {swp_tag})\n"
-              f"Breaker: {px(pair,c['breaker'])} | POC: {px(pair,c['poc'])} | OTE: {px(pair,c['ote'])} (50% FVG)\n"
+              f"FVG: {px(pair,c['fvg_low'])}-{px(pair,c['fvg_high'])} ({fvg_tag}, {c['fvg_type']}{', set '+c['fvg_ts'] if c['fvg_ts'] else ''})\n"
+              f"Liquidity: Sweep {px(pair,c['sweep'])} ({c['sweep_label']}, {swp_tag}) | PDH {lvl_txt(pair,'PDH')} | PDL {lvl_txt(pair,'PDL')}\n"
+              f"Breaker: {px(pair,c['breaker']) if c['breaker'] else 'none yet'}"
+              f" | POC: {poc_display} ({poc_txt})"
+              f" | OTE: {ote_display} (62-79% retracement)\n"
               f"Entry: {px(pair,c['entry'])} | SL: {px(pair,c['sl'])} | TP1: {px(pair,c['tp1'])} | TP2: {px(pair,c['tp2'])}\n"
               f"RR: 1:2 / 1:4 | Window: London 8-10:30, NY 1:30-6 PM WAT | Zone: {px(pair,c['zone_low'])}-{px(pair,c['zone_high'])}\n"
               f"Setup: Sweep {px(pair,c['sweep'])} then CHOCH then FVG retest\n"
               f"Confirmation: 15m CHOCH {c['choch']} + {c['fvg_type']} FVG {fvg_tag} | OB {ob_tag}\n"
               f"News: {news_line(pair)}\n"
-              f"Justification: DXY {dxy:.2f} {'above' if dxy>=99 else 'below'} 99.0 | steps: sweep {s1} CHOCH {s2} FVG {s3} confirm {s4} | risk: BE+0.5 at 50% of TP1\n"
+              f"Context / tracker: DXY {dxy:.2f} (context only, not a signal) | sweep {s1}/1, CHOCH {s2}/1, FVG retest {s3}/1, confirmation {s4}/1 | management: BE+0.5 at 50% of TP1\n"
               f"Status: {status}\n\n<b>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</b>\n\n")
     txt+=("<b>\u26a0\ufe0f Educational only - not financial advice.</b>\n"
           "An entry needs the full sequence (sweep, then CHOCH, then FVG, then 5m confirmation) inside a killzone. "
@@ -724,7 +1025,7 @@ def tick_monitor():
                         conn.execute("REPLACE INTO probables VALUES (?,?,?,?,?,?)",(pair,datetime.now(WAT).isoformat(),c['fvg_low'],c['fvg_high'],c['bias'],"FVG_RETEST")); conn.commit()
                         notify(f"3\ufe0f\u20e3 <b>FVG RETEST {pair} [{kz_name}]</b> @ {now_str}\nInside {px(pair,c['fvg_low'])}-{px(pair,c['fvg_high'])} LIVE\nJournal logged")
                     if s3==1 and s4==0:
-                        # V16.2: never fire an ENTRY into a high-impact release. Steps stay at 3/4,
+                        # V17.0: never fire an ENTRY into a high-impact release. Steps stay at 3/4,
                         # so the entry can still happen once the event window passes.
                         bad,ev,mins=news_blackout(pair)
                         if ev is not None:
@@ -745,7 +1046,7 @@ def tick_monitor():
                             conn.execute("DELETE FROM probables WHERE pair=?",(pair,)); conn.commit()
                             notify(f"\u2705 <b>ENTRY {pair} {c['bias']} [{kz_name}]</b> @ {now_str}\nEntry {px(pair,live)} SL {px(pair,c['sl'])} TP {px(pair,c['tp1'])}/{px(pair,c['tp2'])}\n\U0001f4dd Trade decision journaled \u2014 Full V5.1 confirmation")
             cur=conn.execute("SELECT id, pair, entry, sl, tp1, tp2, bias, result FROM trades WHERE result IN ('OPEN','BE','TP1_HIT')").fetchall()
-            for _t in cur:                                   # V16.2: warn if an open trade runs into news
+            for _t in cur:                                   # V17.0: warn if an open trade runs into news
                 _p=_t[1]
                 _bad,_ev,_m=news_blackout(_p)
                 if _ev is not None and 0 <= _m <= NEWS_BLACKOUT_MIN:
@@ -781,7 +1082,7 @@ def send_long(chat, text):
 # =====================================================================
 # COMMANDS
 # =====================================================================
-HELP_TEXT=("\U0001f916 <b>V16.2 COMMANDS</b> - commands work in any case: /Brief = /brief\n\n"
+HELP_TEXT=("\U0001f916 <b>V17.0 COMMANDS</b> - commands work in any case: /Brief = /brief\n\n"
  "/brief - full 9-pair ICT brief with real candles (same as the 7 AM post)\n"
  "/check - health: webhook, channel, token, prices, candles, DB, open trades\n"
  "/valid - setup validator: real FVG / OB / CHOCH / sweep per pair\n"
@@ -792,9 +1093,26 @@ HELP_TEXT=("\U0001f916 <b>V16.2 COMMANDS</b> - commands work in any case: /Brief
  "/news - economic calendar + headlines (free feed, no key)\n"
  "/reset - clear step tracker ('/reset all confirm' also wipes the journal)\n\n"
  "Educational only.")
+# V17.0 FIX: one brief at a time. The lock makes the busy check atomic even when
+# two different Telegram updates arrive on separate worker threads at once.
+_brief_busy={"on":False}
+_brief_busy_lock=threading.Lock()
+
 @bot.message_handler(commands=['start','brief'])
 def cmd_brief(m):
-    notify("\u2600\ufe0f Fetching TRUE 9 LIVE V16.2 COMPLETE \u2014 er-api + stooq nq.f ym.f dx.f cl.f + gold-api \u2014 WEBHOOK...", chat=m.chat.id)
+    with _brief_busy_lock:
+        busy=_brief_busy["on"]
+        if not busy: _brief_busy["on"]=True
+    if busy:
+        notify("\u23f3 A brief is already being generated - one moment.", chat=m.chat.id)
+        return
+    try:
+        _cmd_brief_inner(m)
+    finally:
+        with _brief_busy_lock: _brief_busy["on"]=False
+
+def _cmd_brief_inner(m):
+    notify("\u2600\ufe0f Fetching TRUE 9 LIVE V17.0 COMPLETE \u2014 er-api + stooq nq.f ym.f dx.f cl.f + gold-api \u2014 WEBHOOK...", chat=m.chat.id)
     try:
         full,d=generate_full()
         send_long(m.chat.id, full)
@@ -901,7 +1219,7 @@ def cmd_steps(m):
 def cmd_pips(m):
     try:
         d=get_live_all_live()
-        out=["\U0001f4b0 <b>P&amp;L SUMMARY V16.2</b>"]
+        out=["\U0001f4b0 <b>P&amp;L SUMMARY V17.0</b>"]
         openrows=conn.execute("SELECT pair, entry, bias, result, pips FROM trades WHERE result IN ('OPEN','BE','TP1_HIT') ORDER BY id DESC").fetchall()
         if openrows:
             out.append("<b>OPEN / IN PROGRESS:</b>")
@@ -956,7 +1274,7 @@ def cmd_journal(m):
             notify("No trades yet \u2014 journal empty", chat=m.chat.id)
             return
         lines=[f"{r[0]} {r[2]} @ {px(r[0],r[1])} | {r[3]} {r[4]:.1f}p {r[5]} LIVE" for r in cur]
-        send_long(m.chat.id, "\U0001f4d2 <b>JOURNAL \u2014 Last 20 trade decisions \u2014 V16.2</b>\n\n" + "\n".join(lines))
+        send_long(m.chat.id, "\U0001f4d2 <b>JOURNAL \u2014 Last 20 trade decisions \u2014 V17.0</b>\n\n" + "\n".join(lines))
     except Exception as e:
         import traceback; print(traceback.format_exc()); notify(f"Error {e}", chat=m.chat.id)
 # [OK] NEW: /reset  clears the step tracker; journal only with an explicit confirm
@@ -1007,7 +1325,7 @@ def scheduler():
 # =====================================================================
 if __name__=="__main__":
     print("=" * 60)
-    print("STARTING V16.2 \u2014 webhook mode, no polling, no 409/401")
+    print("STARTING V17.0 \u2014 webhook mode, no polling, no 409/401")
     print(f"PORT={PORT} | TELEGRAM_TOKEN={'SET' if TOKEN else 'MISSING \u274c'} | CHANNEL_ID={CHANNEL_ID} | RENDER_URL={RENDER_URL}")
     print(f"CANDLE_SOURCE={CANDLE_SOURCE.upper()} (deriv = public market data, no login, works from datacenters)")
     print("=" * 60)
@@ -1018,5 +1336,5 @@ if __name__=="__main__":
     threading.Thread(target=keep_alive,daemon=True).start()
     threading.Thread(target=tick_monitor,daemon=True).start()
     threading.Thread(target=scheduler,daemon=True).start()
-    print("V16.2 COMPLETE WEBHOOK TRUE LIVE \u2014 All features intact \u2014 No polling \u2014 No 409/401")
+    print("V17.0 COMPLETE WEBHOOK TRUE LIVE \u2014 All features intact \u2014 No polling \u2014 No 409/401")
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)   #  keeps process alive
